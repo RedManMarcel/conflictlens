@@ -1,12 +1,15 @@
+const { createClient } = require('@supabase/supabase-js');
 const https = require('https');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  console.error('FATAL: Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
   process.exit(1);
 }
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const FEEDS = [
   {name:'Reuters',url:'https://www.reutersagency.com/feed/?taxonomy=markets&post_type=reuters-best',bias:'Center'},
@@ -49,35 +52,115 @@ const CONFLICT_KWS = {
   'south-sudan-conflict':['south sudan','juba'],
 };
 
-function matchConflict(t,d){const tx=(t+' '+(d||'')).toLowerCase();for(const[id,kws]of Object.entries(CONFLICT_KWS))for(const kw of kws)if(tx.includes(kw))return id;return null;}
-
-function httpGet(url){return new Promise((res,rej)=>{const req=https.get(url,{timeout:15000},r=>{if(r.statusCode>=300&&r.statusCode<400&&r.headers.location)return res(httpGet(r.headers.location));let d='';r.on('data',c=>d+=c);r.on('end',()=>res(d));});req.on('error',rej);req.on('timeout',()=>{req.destroy();rej(new Error('timeout'));});});}
-
-function parseRSS(xml){const items=[];const matches=xml.match(/<item>[\s\S]*?<\/item>/g)||[];for(const item of matches.slice(0,4)){const title=(item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\])?<\/title>/i)||[])[1]?.trim()||'';const desc=(item.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\])?<\/description>/i)||[])[1]?.trim()||'';const link=(item.match(/<link>(.*?)<\/link>/i)||[])[1]?.trim()||'';const pubDate=(item.match(/<pubDate>(.*?)<\/pubDate>/i)||[])[1]?.trim()||new Date().toISOString();if(title)items.push({title,description:desc,link,pubDate});}return items;}
-
-async function insertArticle(article,feed){
-  const cid=matchConflict(article.title,article.description);
-  const body=JSON.stringify({title:article.title.slice(0,500),summary:(article.description||'').slice(0,2000),url:(article.link||'').slice(0,1000),source:feed.name,source_feed:feed.name,bias:feed.bias,confidence:0.7,emotional_score:0.3,credibility_score:3,flagged_phrases:[],reasoning:'Source: '+feed.name,conflict_id:cid,published_at:new Date(article.pubDate).toISOString()});
-  return new Promise(resolve=>{const u=new URL(SUPABASE_URL+'/rest/v1/articles');const req=https.request(u,{method:'POST',headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Content-Type':'application/json','Prefer':'resolution=ignore-duplicates'},timeout:10000},r=>{resolve(r.statusCode===201||r.statusCode===204);});req.on('error',()=>resolve(false));req.on('timeout',()=>{req.destroy();resolve(false);});req.write(body);req.end();});
-}
-
-async function main(){
-  let total=0,stored=0;
-  for(const feed of FEEDS){
-    process.stdout.write(feed.name+' ... ');
-    try{
-      const xml=await httpGet(feed.url);
-      const articles=parseRSS(xml);
-      process.stdout.write(articles.length+' articles → ');
-      let fs=0;
-      for(const a of articles){if(await insertArticle(a,feed)){stored++;fs++;}}
-      console.log(fs+' stored');
-      total+=articles.length;
-    }catch(e){console.log('ERROR: '+e.message);}
-    await new Promise(r=>setTimeout(r,500));
+function matchConflict(t, d) {
+  const text = (t + ' ' + (d || '')).toLowerCase();
+  for (const [id, kws] of Object.entries(CONFLICT_KWS)) {
+    for (const kw of kws) { if (text.includes(kw)) return id; }
   }
-  console.log('\n=== Done: '+total+' fetched, '+stored+' stored ===');
-  if(stored===0){console.error('No articles stored — check secrets');process.exit(1);}
+  return null;
 }
 
-main().catch(e=>{console.error(e);process.exit(1);});
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { timeout: 15000 }, (res) => {
+      console.log(`  HTTP status: ${res.statusCode}`);
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        console.log(`  Redirect to: ${res.headers.location}`);
+        return resolve(httpGet(res.headers.location));
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
+    }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function parseRSS(xml) {
+  const items = [];
+  const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
+  const entryMatches = xml.match(/<entry>[\s\S]*?<\/entry>/gi) || [];
+  const allMatches = [...itemMatches, ...entryMatches];
+  console.log(`  Raw XML length: ${xml.length}, found ${itemMatches.length} <item> and ${entryMatches.length} <entry>`);
+  for (const item of allMatches.slice(0, 4)) {
+    const titleMatch = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+    const descMatch = item.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i) || item.match(/<summary>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/summary>/i);
+    const linkMatch = item.match(/<link>(.*?)<\/link>/i) || item.match(/<link[^>]*href="([^"]*)"/i);
+    const dateMatch = item.match(/<pubDate>(.*?)<\/pubDate>/i) || item.match(/<published>(.*?)<\/published>/i) || item.match(/<updated>(.*?)<\/updated>/i);
+    const title = titleMatch ? titleMatch[1].trim() : '';
+    const desc = descMatch ? descMatch[1].trim() : '';
+    const link = linkMatch ? linkMatch[1].trim() : '';
+    const pubDate = dateMatch ? dateMatch[1].trim() : new Date().toISOString();
+    if (title && title.length > 5) {
+      items.push({ title, description: desc, link, pubDate });
+    }
+  }
+  return items;
+}
+
+async function insertArticle(article, feed) {
+  const conflictId = matchConflict(article.title, article.description);
+  const { error } = await supabase.from('articles').insert({
+    title: article.title.slice(0, 500),
+    summary: (article.description || '').slice(0, 2000),
+    url: (article.link || 'https://example.com/' + Date.now()).slice(0, 1000),
+    source: feed.name,
+    source_feed: feed.name,
+    bias: feed.bias,
+    confidence: 0.7,
+    emotional_score: 0.3,
+    credibility_score: 3,
+    flagged_phrases: [],
+    reasoning: `Source: ${feed.name}`,
+    conflict_id: conflictId,
+    published_at: new Date(article.pubDate).toISOString(),
+  });
+  if (error) {
+    console.log(`    INSERT ERROR: ${error.message}`);
+    return false;
+  }
+  return true;
+}
+
+async function main() {
+  console.log('=== ConflictLens RSS Ingest ===');
+  console.log(`Supabase: ${SUPABASE_URL}`);
+  console.log('\nTesting Supabase connection...');
+  const { data: testData, error: testError } = await supabase.from('conflicts').select('id').limit(1);
+  if (testError) {
+    console.error(`Supabase connection FAILED: ${testError.message}`);
+    process.exit(1);
+  }
+  console.log(`Supabase OK. Conflicts table has rows: ${testData ? testData.length : 0}`);
+  let total = 0, stored = 0;
+  for (const feed of FEEDS) {
+    console.log(`\n${feed.name} (${feed.bias})`);
+    try {
+      const xml = await httpGet(feed.url);
+      const articles = parseRSS(xml);
+      console.log(`  Parsed ${articles.length} articles`);
+      let feedStored = 0;
+      for (const article of articles) {
+        console.log(`    -> "${article.title.slice(0, 60)}..."`);
+        const ok = await insertArticle(article, feed);
+        if (ok) { stored++; feedStored++; }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      console.log(`  Stored: ${feedStored}/${articles.length}`);
+      total += articles.length;
+    } catch (err) {
+      console.log(`  FETCH ERROR: ${err.message}`);
+    }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  console.log(`\n=== SUMMARY: ${total} fetched, ${stored} stored ===`);
+  const { count } = await supabase.from('articles').select('*', { count: 'exact', head: true });
+  console.log(`Total articles in DB: ${count !== null ? count : 'unknown'}`);
+  if (stored === 0) {
+    console.error('WARNING: No articles stored!');
+    process.exit(1);
+  }
+}
+main().catch(e => { console.error('FATAL:', e); process.exit(1); });
