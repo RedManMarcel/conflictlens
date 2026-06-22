@@ -63,9 +63,7 @@ function matchConflict(t, d) {
 function httpGet(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { timeout: 15000 }, (res) => {
-      console.log(`  HTTP status: ${res.statusCode}`);
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        console.log(`  Redirect to: ${res.headers.location}`);
         return resolve(httpGet(res.headers.location));
       }
       if (res.statusCode !== 200) {
@@ -82,19 +80,14 @@ function parseRSS(xml) {
   const items = [];
   const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
   const entryMatches = xml.match(/<entry>[\s\S]*?<\/entry>/gi) || [];
-  const allMatches = [...itemMatches, ...entryMatches];
-  console.log(`  Raw XML length: ${xml.length}, found ${itemMatches.length} <item> and ${entryMatches.length} <entry>`);
-  for (const item of allMatches.slice(0, 4)) {
-    const titleMatch = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
-    const descMatch = item.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i) || item.match(/<summary>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/summary>/i);
-    const linkMatch = item.match(/<link>(.*?)<\/link>/i) || item.match(/<link[^>]*href="([^"]*)"/i);
-    const dateMatch = item.match(/<pubDate>(.*?)<\/pubDate>/i) || item.match(/<published>(.*?)<\/published>/i) || item.match(/<updated>(.*?)<\/updated>/i);
-    const title = titleMatch ? titleMatch[1].trim() : '';
-    const desc = descMatch ? descMatch[1].trim() : '';
-    const link = linkMatch ? linkMatch[1].trim() : '';
-    const pubDate = dateMatch ? dateMatch[1].trim() : new Date().toISOString();
-    if (title && title.length > 5) {
-      items.push({ title, description: desc, link, pubDate });
+  console.log(`  XML: ${xml.length} chars, ${itemMatches.length} <item>, ${entryMatches.length} <entry>`);
+  for (const item of [...itemMatches, ...entryMatches].slice(0, 4)) {
+    const tm = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+    const dm = item.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i) || item.match(/<summary>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/summary>/i);
+    const lm = item.match(/<link>(.*?)<\/link>/i) || item.match(/<link[^>]*href="([^"]*)"/i);
+    const pdm = item.match(/<pubDate>(.*?)<\/pubDate>/i) || item.match(/<published>(.*?)<\/published>/i);
+    if (tm && tm[1].trim().length > 5) {
+      items.push({ title: tm[1].trim(), description: (dm && dm[1].trim()) || '', link: (lm && lm[1].trim()) || '', pubDate: (pdm && pdm[1].trim()) || new Date().toISOString() });
     }
   }
   return items;
@@ -118,7 +111,7 @@ async function insertArticle(article, feed) {
     published_at: new Date(article.pubDate).toISOString(),
   });
   if (error) {
-    console.log(`    INSERT ERROR: ${error.message}`);
+    console.log(`    ERROR: ${error.message}`);
     return false;
   }
   return true;
@@ -127,40 +120,34 @@ async function insertArticle(article, feed) {
 async function main() {
   console.log('=== ConflictLens RSS Ingest ===');
   console.log(`Supabase: ${SUPABASE_URL}`);
-  console.log('\nTesting Supabase connection...');
-  const { data: testData, error: testError } = await supabase.from('conflicts').select('id').limit(1);
-  if (testError) {
-    console.error(`Supabase connection FAILED: ${testError.message}`);
-    process.exit(1);
-  }
-  console.log(`Supabase OK. Conflicts table has rows: ${testData ? testData.length : 0}`);
+
+  const { data: td, error: te } = await supabase.from('conflicts').select('id').limit(1);
+  if (te) { console.error(`Connection FAILED: ${te.message}`); process.exit(1); }
+  console.log(`Connected. Conflicts: ${td ? td.length : 0}`);
+
   let total = 0, stored = 0;
   for (const feed of FEEDS) {
-    console.log(`\n${feed.name} (${feed.bias})`);
+    console.log(`\n${feed.name}`);
     try {
       const xml = await httpGet(feed.url);
       const articles = parseRSS(xml);
-      console.log(`  Parsed ${articles.length} articles`);
-      let feedStored = 0;
-      for (const article of articles) {
-        console.log(`    -> "${article.title.slice(0, 60)}..."`);
-        const ok = await insertArticle(article, feed);
-        if (ok) { stored++; feedStored++; }
+      console.log(`  Articles: ${articles.length}`);
+      let fs = 0;
+      for (const a of articles) {
+        console.log(`    -> "${a.title.slice(0, 50)}..."`);
+        if (await insertArticle(a, feed)) { stored++; fs++; }
         await new Promise(r => setTimeout(r, 50));
       }
-      console.log(`  Stored: ${feedStored}/${articles.length}`);
+      console.log(`  Stored: ${fs}/${articles.length}`);
       total += articles.length;
-    } catch (err) {
-      console.log(`  FETCH ERROR: ${err.message}`);
-    }
+    } catch (e) { console.log(`  FAIL: ${e.message}`); }
     await new Promise(r => setTimeout(r, 300));
   }
-  console.log(`\n=== SUMMARY: ${total} fetched, ${stored} stored ===`);
+
+  console.log(`\n=== ${total} fetched, ${stored} stored ===`);
   const { count } = await supabase.from('articles').select('*', { count: 'exact', head: true });
-  console.log(`Total articles in DB: ${count !== null ? count : 'unknown'}`);
-  if (stored === 0) {
-    console.error('WARNING: No articles stored!');
-    process.exit(1);
-  }
+  console.log(`DB total: ${count}`);
+
+  if (stored === 0) { console.error('Nothing stored!'); process.exit(1); }
 }
-main().catch(e => { console.error('FATAL:', e); process.exit(1); });
+main().catch(e => { console.error(e); process.exit(1); });
