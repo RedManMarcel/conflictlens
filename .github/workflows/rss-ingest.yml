@@ -14,6 +14,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Test network
+        run: |
+          echo "Testing DNS resolution..."
+          nslookup brfuimkocfqhtggrucsv.supabase.co || true
+          dig brfuimkocfqhtggrucsv.supabase.co || true
+          echo "Testing curl..."
+          curl -s -o /dev/null -w "%{http_code}" -H "apikey: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" https://brfuimkocfqhtggrucsv.supabase.co/rest/v1/conflicts?select=id&limit=1 || true
       - run: node scripts/ingest.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
