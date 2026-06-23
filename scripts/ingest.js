@@ -1,5 +1,5 @@
-const { createClient } = require('@supabase/supabase-js');
 const https = require('https');
+const { URL } = require('url');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -9,7 +9,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const HOST = new URL(SUPABASE_URL).host;
 
 const FEEDS = [
   {name:'Reuters',url:'https://www.reutersagency.com/feed/?taxonomy=markets&post_type=reuters-best',bias:'Center'},
@@ -66,9 +66,53 @@ function httpGet(url) {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return resolve(httpGet(res.headers.location));
       }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode}`));
-      }
+      if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
+    }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function supabasePost(path, body) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(body);
+    const req = https.request({
+      hostname: HOST,
+      path: '/rest/v1' + path,
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=ignore-duplicates',
+        'Content-Length': Buffer.byteLength(bodyStr),
+      },
+      timeout: 15000,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', (e) => reject(e));
+    req.on('timeout', function() { this.destroy(); reject(new Error('timeout')); });
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+function supabaseGet(path) {
+  return new Promise((resolve, reject) => {
+    https.get({
+      hostname: HOST,
+      path: '/rest/v1' + path,
+      headers: {
+        'apikey': SUPABASE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_KEY,
+      },
+      timeout: 15000,
+    }, (res) => {
+      if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve(data));
@@ -78,16 +122,20 @@ function httpGet(url) {
 
 function parseRSS(xml) {
   const items = [];
-  const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
-  const entryMatches = xml.match(/<entry>[\s\S]*?<\/entry>/gi) || [];
-  console.log(`  XML: ${xml.length} chars, ${itemMatches.length} <item>, ${entryMatches.length} <entry>`);
-  for (const item of [...itemMatches, ...entryMatches].slice(0, 4)) {
+  const matches = xml.match(/<item>[\s\S]*?<\/item>/gi) || [];
+  console.log('  XML: ' + xml.length + ' chars, ' + matches.length + ' <item>');
+  for (const item of matches.slice(0, 4)) {
     const tm = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
-    const dm = item.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i) || item.match(/<summary>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/summary>/i);
-    const lm = item.match(/<link>(.*?)<\/link>/i) || item.match(/<link[^>]*href="([^"]*)"/i);
-    const pdm = item.match(/<pubDate>(.*?)<\/pubDate>/i) || item.match(/<published>(.*?)<\/published>/i);
+    const dm = item.match(/<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/i);
+    const lm = item.match(/<link>(.*?)<\/link>/i);
+    const pdm = item.match(/<pubDate>(.*?)<\/pubDate>/i);
     if (tm && tm[1].trim().length > 5) {
-      items.push({ title: tm[1].trim(), description: (dm && dm[1].trim()) || '', link: (lm && lm[1].trim()) || '', pubDate: (pdm && pdm[1].trim()) || new Date().toISOString() });
+      items.push({
+        title: tm[1].trim(),
+        description: (dm && dm[1].trim()) || '',
+        link: (lm && lm[1].trim()) || '',
+        pubDate: (pdm && pdm[1].trim()) || new Date().toISOString(),
+      });
     }
   }
   return items;
@@ -95,59 +143,65 @@ function parseRSS(xml) {
 
 async function insertArticle(article, feed) {
   const conflictId = matchConflict(article.title, article.description);
-  const { error } = await supabase.from('articles').insert({
-    title: article.title.slice(0, 500),
-    summary: (article.description || '').slice(0, 2000),
-    url: (article.link || 'https://example.com/' + Date.now()).slice(0, 1000),
-    source: feed.name,
-    source_feed: feed.name,
-    bias: feed.bias,
-    confidence: 0.7,
-    emotional_score: 0.3,
-    credibility_score: 3,
-    flagged_phrases: [],
-    reasoning: `Source: ${feed.name}`,
-    conflict_id: conflictId,
-    published_at: new Date(article.pubDate).toISOString(),
-  });
-  if (error) {
-    console.log(`    ERROR: ${error.message}`);
+  try {
+    const res = await supabasePost('/articles', {
+      title: article.title.slice(0, 500),
+      summary: (article.description || '').slice(0, 2000),
+      url: (article.link || 'https://example.com/' + Date.now()).slice(0, 1000),
+      source: feed.name,
+      source_feed: feed.name,
+      bias: feed.bias,
+      confidence: 0.7,
+      emotional_score: 0.3,
+      credibility_score: 3,
+      flagged_phrases: [],
+      reasoning: 'Source: ' + feed.name,
+      conflict_id: conflictId,
+      published_at: new Date(article.pubDate).toISOString(),
+    });
+    if (res.status === 201 || res.status === 204) return true;
+    console.log('    HTTP ' + res.status + ': ' + res.body.slice(0, 200));
+    return false;
+  } catch (e) {
+    console.log('    POST ERROR: ' + e.message);
     return false;
   }
-  return true;
 }
 
 async function main() {
   console.log('=== ConflictLens RSS Ingest ===');
-  console.log(`Supabase: ${SUPABASE_URL}`);
-
-  const { data: td, error: te } = await supabase.from('conflicts').select('id').limit(1);
-  if (te) { console.error(`Connection FAILED: ${te.message}`); process.exit(1); }
-  console.log(`Connected. Conflicts: ${td ? td.length : 0}`);
-
+  console.log('Host: ' + HOST);
+  console.log('\nTesting Supabase connection...');
+  try {
+    const testData = await supabaseGet('/conflicts?select=id&limit=1');
+    console.log('Connected. Conflicts: ' + JSON.parse(testData).length);
+  } catch (e) {
+    console.error('Connection FAILED: ' + e.message);
+    process.exit(1);
+  }
   let total = 0, stored = 0;
   for (const feed of FEEDS) {
-    console.log(`\n${feed.name}`);
+    console.log('\n' + feed.name);
     try {
       const xml = await httpGet(feed.url);
       const articles = parseRSS(xml);
-      console.log(`  Articles: ${articles.length}`);
+      console.log('  Articles: ' + articles.length);
       let fs = 0;
       for (const a of articles) {
-        console.log(`    -> "${a.title.slice(0, 50)}..."`);
+        console.log('    -> "' + a.title.slice(0, 50) + '..."');
         if (await insertArticle(a, feed)) { stored++; fs++; }
         await new Promise(r => setTimeout(r, 50));
       }
-      console.log(`  Stored: ${fs}/${articles.length}`);
+      console.log('  Stored: ' + fs + '/' + articles.length);
       total += articles.length;
-    } catch (e) { console.log(`  FAIL: ${e.message}`); }
+    } catch (e) { console.log('  FAIL: ' + e.message); }
     await new Promise(r => setTimeout(r, 300));
   }
-
-  console.log(`\n=== ${total} fetched, ${stored} stored ===`);
-  const { count } = await supabase.from('articles').select('*', { count: 'exact', head: true });
-  console.log(`DB total: ${count}`);
-
+  console.log('\n=== ' + total + ' fetched, ' + stored + ' stored ===');
+  try {
+    const countData = await supabaseGet('/articles?select=id');
+    console.log('DB total articles: ' + JSON.parse(countData).length);
+  } catch (e) { console.log('Count check failed: ' + e.message); }
   if (stored === 0) { console.error('Nothing stored!'); process.exit(1); }
 }
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => { console.error('FATAL:', e); process.exit(1); });
